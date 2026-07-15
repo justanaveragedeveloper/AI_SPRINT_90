@@ -1,0 +1,6 @@
+# Create config file in your project folder
+@"
+projectRoot = `"`."
+scanDepth = 2
+maxFiles = 100
+"@ | Out-File -FilePath .sigmap -Encoding utf8
