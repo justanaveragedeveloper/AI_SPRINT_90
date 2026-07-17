@@ -60,8 +60,8 @@ export class AiTaskPriorityQueue {
       throw new TypeError("priorityScore must be a valid number.");
     }
 
-    if (typeof task.query !== "string") {
-      throw new TypeError("query must be a string.");
+    if (typeof task.executionFn !== "function") {
+      throw new TypeError("executionFn must be a function.");
     }
   }
 
