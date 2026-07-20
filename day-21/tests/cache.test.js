@@ -112,7 +112,13 @@ describe("Cache Service", () => {
           this.headers[name] = value;
         },
 
-        writeHead() {},
+        writeHead(status, headers) {
+          this.statusCode = status;
+          this.headers = {
+            ...this.headers,
+            ...headers,
+          };
+        },
 
         write(chunk) {
           this.body += chunk;

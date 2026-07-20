@@ -1,0 +1,2720 @@
+=== server.js ===
+"use strict";
+
+const app = require("./app");
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`AI Gateway running on port ${PORT}`);
+});
+=== app.js ===
+const express = require("express");
+
+const gatewayConfig = require("./config/gatewayConfig");
+
+const GatewayWorkerPool = require("./worker/GatewayWorkerPool");
+const ActiveTaskRegistry = require("./worker/ActiveTaskRegistry");
+const GatewayPriorityQueue = require("./queue/GatewayPriorityQueue");
+
+const createAiRoutes = require("./routes/aiRoutes");
+const logger = require("./utils/logger");
+
+/**
+ * ==========================================================
+ * Application Bootstrap
+ * ==========================================================
+ */
+
+const app = express();
+
+app.use(express.json());
+
+/**
+ * ==========================================================
+ * Shared Infrastructure
+ * ==========================================================
+ */
+
+const gatewayPool = new GatewayWorkerPool(gatewayConfig.maxConcurrency);
+
+const activeTaskRegistry = new ActiveTaskRegistry();
+
+/**
+ * Temporary cache.
+ * Replace with the LRU cache later.
+ */
+
+const cache = {
+  store: new Map(),
+
+  get(key) {
+    return this.store.get(key);
+  },
+
+  put(key, value) {
+    this.store.set(key, value);
+  },
+};
+
+const gatewayQueue = new GatewayPriorityQueue({
+  workerPool: gatewayPool,
+  activeTaskRegistry,
+});
+
+/**
+ * ==========================================================
+ * Routes
+ * ==========================================================
+ */
+
+app.use(
+  "/api/ai",
+  createAiRoutes({
+    gatewayQueue,
+    cache,
+    activeTaskRegistry,
+  }),
+);
+
+/**
+ * ==========================================================
+ * Health Check
+ * ==========================================================
+ */
+
+app.get("/health", (_, res) => {
+  res.json({
+    status: "ok",
+  });
+});
+
+/**
+ * ==========================================================
+ * Global Error Handler
+ * ==========================================================
+ */
+
+app.use((err, req, res, next) => {
+  logger.error("Unhandled application error", {
+    error: err.message,
+    stack: err.stack,
+  });
+
+  const statusCode = err.statusCode ?? 500;
+
+  res.status(statusCode).json({
+    error: err.message,
+  });
+});
+
+module.exports = app;
+=== config\gatewayConfig.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * AI Gateway Configuration
+ * ==========================================================
+ *
+ * Centralized configuration used throughout the gateway.
+ * Keeping configuration in one place makes the application
+ * easier to maintain and avoids magic numbers.
+ */
+
+// ==========================================================
+// Defaults
+// ==========================================================
+
+const DEFAULT_MAX_CONCURRENCY = 4;
+const DEFAULT_CACHE_CAPACITY = 500;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+// ==========================================================
+// Environment Variables
+// ==========================================================
+
+const MAX_AI_CONCURRENCY = Number.parseInt(
+  process.env.MAX_AI_CONCURRENCY,
+  10,
+);
+
+const PYTHON_AI_SERVICE_URL =
+  process.env.PYTHON_AI_SERVICE_URL ??
+  "http://localhost:5001/stream";
+
+// ==========================================================
+// Safe Configuration
+// ==========================================================
+
+const gatewayConfig = {
+  /**
+   * Maximum number of AI requests that can execute
+   * simultaneously.
+   */
+  maxConcurrency:
+    Number.isInteger(MAX_AI_CONCURRENCY) &&
+    MAX_AI_CONCURRENCY > 0
+      ? MAX_AI_CONCURRENCY
+      : DEFAULT_MAX_CONCURRENCY,
+
+  /**
+   * Maximum number of cached responses.
+   */
+  cacheCapacity: DEFAULT_CACHE_CAPACITY,
+
+  /**
+   * Timeout for Python inference service.
+   */
+  requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+
+  /**
+   * Python AI Streaming Endpoint.
+   */
+  pythonServiceUrl: PYTHON_AI_SERVICE_URL,
+};
+
+// ==========================================================
+// Exports
+// ==========================================================
+
+module.exports = gatewayConfig;
+=== controllers\aiController.js ===
+"use strict";
+
+const { validateRequest } = require("../services/validationService");
+
+const {
+  buildCacheKey,
+  tryServeCachedResponse,
+} = require("../services/cacheService");
+
+const { createGatewayTask } = require("../services/taskFactory");
+
+const { cleanupAbortedTask } = require("../utils/workerHelpers");
+
+/**
+ * ==========================================================
+ * AI Controller
+ * ==========================================================
+ *
+ * Responsibilities:
+ *
+ * 1. Validate request
+ * 2. Check cache
+ * 3. Create task
+ * 4. Register disconnect handler
+ * 5. Enqueue task
+ *
+ * The controller contains NO business logic.
+ */
+
+function createAiController({ gatewayQueue, cache, activeTaskRegistry }) {
+  return async function aiController(req, res, next) {
+    try {
+      const { prompt, tier, ragParams } = validateRequest(req.body);
+
+      const cacheKey = buildCacheKey(prompt, ragParams);
+
+      const cacheHit = tryServeCachedResponse({
+        cache,
+        cacheKey,
+        res,
+      });
+
+      if (cacheHit) {
+        return;
+      }
+
+      const abortController = new AbortController();
+
+      const task = createGatewayTask({
+        prompt,
+        tier,
+        ragParams,
+        cache,
+        cacheKey,
+        res,
+        abortController,
+      });
+
+      req.on("close", () => {
+        cleanupAbortedTask({
+          gatewayQueue,
+          activeTaskRegistry,
+          task,
+          abortController,
+        });
+      });
+
+      gatewayQueue.enqueue(task);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+module.exports = createAiController;
+=== errors\AppError.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Base Application Error
+ * ==========================================================
+ *
+ * Parent class for all custom application errors.
+ */
+
+class AppError extends Error {
+  constructor(message, statusCode = 500) {
+    super(message);
+
+    this.name = this.constructor.name;
+    this.statusCode = statusCode;
+
+    Error.captureStackTrace?.(this, this.constructor);
+  }
+}
+
+module.exports = AppError;
+=== errors\ValidationError.js ===
+"use strict";
+
+const AppError = require("./AppError");
+
+/**
+ * ==========================================================
+ * Validation Error
+ * ==========================================================
+ *
+ * Represents invalid client input.
+ */
+
+class ValidationError extends AppError {
+  constructor(message) {
+    super(message, 400);
+  }
+}
+
+module.exports = ValidationError;
+=== routes\aiRoutes.js ===
+"use strict";
+
+const express = require("express");
+
+const createAiController = require("../controllers/aiController");
+
+function createAiRoutes({ gatewayQueue, cache, activeTaskRegistry }) {
+  const router = express.Router();
+
+  const aiController = createAiController({
+    gatewayQueue,
+    cache,
+    activeTaskRegistry,
+  });
+
+  router.post("/generate", aiController);
+
+  return router;
+}
+
+module.exports = createAiRoutes;
+=== services\cacheService.js ===
+"use strict";
+
+const generateCacheKey = require("../utils/cacheKey");
+const {
+  writeSseHeaders,
+  writeSseData,
+  finishSseStream,
+} = require("../utils/sse");
+
+/**
+ * ==========================================================
+ * Cache Service
+ * ==========================================================
+ *
+ * Responsible for all cache-related operations.
+ *
+ * The controller should never directly access the LRU cache.
+ * Instead, it asks this service to:
+ *
+ * 1. Generate cache keys
+ * 2. Read cached responses
+ * 3. Store completed responses
+ * 4. Serve cached SSE responses
+ */
+
+// ==========================================================
+// Cache Key
+// ==========================================================
+
+function buildCacheKey(prompt, ragParams) {
+  return generateCacheKey(prompt, ragParams);
+}
+
+// ==========================================================
+// Cache Read
+// ==========================================================
+
+function getCachedResponse(cache, cacheKey) {
+  return cache.get(cacheKey);
+}
+
+// ==========================================================
+// Cache Write
+// ==========================================================
+
+function storeResponse(cache, cacheKey, response) {
+  cache.put(cacheKey, response);
+}
+
+// ==========================================================
+// Cache Hit Response
+// ==========================================================
+
+/**
+ * Sends a cached response to the client using
+ * Server-Sent Events.
+ *
+ * Returns:
+ * true  -> cache hit
+ * false -> cache miss
+ */
+function tryServeCachedResponse({ cache, cacheKey, res }) {
+  const cachedResponse = getCachedResponse(cache, cacheKey);
+
+  if (!cachedResponse) {
+    return false;
+  }
+
+  writeSseHeaders(res, "HIT");
+
+  writeSseData(res, {
+    text: cachedResponse,
+    done: true,
+  });
+
+  finishSseStream(res);
+
+  return true;
+}
+
+// ==========================================================
+// Exports
+// ==========================================================
+
+module.exports = {
+  buildCacheKey,
+  getCachedResponse,
+  storeResponse,
+  tryServeCachedResponse,
+};
+=== services\streamService.js ===
+"use strict";
+
+const axios = require("axios");
+
+const gatewayConfig = require("../config/gatewayConfig");
+
+const {
+  writeSseHeaders,
+  writeSseData,
+  finishSseStream,
+  writeSseError,
+} = require("../utils/sse");
+
+const { storeResponse } = require("./cacheService");
+
+/**
+ * ==========================================================
+ * Stream Service
+ * ==========================================================
+ *
+ * Responsibilities:
+ *
+ * 1. Call the Python AI service
+ * 2. Stream chunks to the client
+ * 3. Build the complete response
+ * 4. Store completed response in cache
+ *
+ * This service intentionally knows NOTHING about:
+ * - Worker pools
+ * - Priority queues
+ * - Controllers
+ * - Express routing
+ */
+
+async function streamPythonResponse({
+  res,
+  prompt,
+  ragParams,
+  cache,
+  cacheKey,
+  abortController,
+}) {
+  writeSseHeaders(res, "MISS");
+
+  let completeResponse = "";
+
+  try {
+    const response = await axios({
+      method: "post",
+      url: gatewayConfig.pythonServiceUrl,
+      timeout: gatewayConfig.requestTimeoutMs,
+      signal: abortController.signal,
+      responseType: "stream",
+      data: {
+        prompt,
+        ...ragParams,
+      },
+    });
+
+    await new Promise((resolve, reject) => {
+      response.data.on("data", (chunk) => {
+        if (abortController.signal.aborted) {
+          return;
+        }
+
+        const text = chunk.toString();
+
+        completeResponse += text;
+
+        writeSseData(res, {
+          text,
+          done: false,
+        });
+      });
+
+      response.data.on("end", () => {
+        if (!abortController.signal.aborted) {
+          storeResponse(cache, cacheKey, completeResponse);
+
+          finishSseStream(res);
+        }
+
+        resolve();
+      });
+
+      response.data.on("error", reject);
+    });
+  } catch (error) {
+    if (abortController.signal.aborted || error.name === "CanceledError") {
+      return;
+    }
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: "Streaming gateway processing failure.",
+      });
+    }
+
+    writeSseError(res, "Streaming gateway processing failure.");
+
+    throw error;
+  }
+}
+
+module.exports = {
+  streamPythonResponse,
+};
+=== services\taskFactory.js ===
+"use strict";
+
+const crypto = require("crypto");
+
+const estimateTokenLength = require("../utils/tokenEstimator");
+
+const { streamPythonResponse } = require("./streamService");
+
+/**
+ * ==========================================================
+ * Gateway Task Factory
+ * ==========================================================
+ *
+ * Responsible ONLY for creating executable gateway tasks.
+ */
+
+function calculateTaskWeight(prompt, tier) {
+  const tokenCount = estimateTokenLength(prompt);
+
+  const tierModifier = tier === "premium" ? 1 : 5;
+
+  return tierModifier * tokenCount;
+}
+
+function createGatewayTask({
+  prompt,
+  tier,
+  ragParams,
+
+  cache,
+  cacheKey,
+
+  res,
+
+  abortController,
+}) {
+  return {
+    id: crypto.randomUUID(),
+
+    weight: calculateTaskWeight(prompt, tier),
+
+    prompt,
+
+    ragParams,
+
+    abortController,
+
+    async execute() {
+      if (abortController.signal.aborted) {
+        return;
+      }
+
+      await streamPythonResponse({
+        res,
+        prompt,
+        ragParams,
+        cache,
+        cacheKey,
+        abortController,
+      });
+    },
+  };
+}
+
+module.exports = {
+  calculateTaskWeight,
+  createGatewayTask,
+};
+=== services\validationService.js ===
+"use strict";
+
+const ValidationError = require("../errors/ValidationError");
+
+/**
+ * ==========================================================
+ * Validation Service
+ * ==========================================================
+ *
+ * Responsible for validating every incoming AI request
+ * before it enters the gateway pipeline.
+ *
+ * This service does NOT send HTTP responses.
+ * It only validates data and throws Errors when something
+ * is invalid.
+ */
+
+// ==========================================================
+// Constants
+// ==========================================================
+
+const MAX_PROMPT_LENGTH = 50_000;
+
+const ALLOWED_TIERS = new Set(["free", "premium"]);
+
+// ==========================================================
+// Prompt Validation
+// ==========================================================
+
+function validatePrompt(prompt) {
+  if (typeof prompt !== "string") {
+    throw new ValidationError("Prompt must be a string.");
+  }
+
+  const trimmedPrompt = prompt.trim();
+
+  if (trimmedPrompt.length === 0) {
+    throw new ValidationError("Prompt cannot be empty.");
+  }
+
+  if (trimmedPrompt.length > MAX_PROMPT_LENGTH) {
+    throw new ValidationError("Prompt exceeds maximum allowed size.");
+  }
+
+  return trimmedPrompt;
+}
+
+// ==========================================================
+// Tier Validation
+// ==========================================================
+
+function validateTier(tier = "free") {
+  const normalizedTier = String(tier).toLowerCase();
+
+  if (!ALLOWED_TIERS.has(normalizedTier)) {
+    throw new ValidationError(`Unsupported tier "${tier}".`);
+  }
+
+  return normalizedTier;
+}
+
+// ==========================================================
+// RAG Parameter Validation
+// ==========================================================
+
+function validateRagParams(ragParams = {}) {
+  if (
+    ragParams === null ||
+    typeof ragParams !== "object" ||
+    Array.isArray(ragParams)
+  ) {
+    throw new ValidationError("ragParams must be an object.");
+  }
+
+  return ragParams;
+}
+
+// ==========================================================
+// Complete Request Validation
+// ==========================================================
+
+/**
+ * Validates an entire AI request.
+ *
+ * Returns a cleaned object that can safely be
+ * passed to downstream services.
+ */
+function validateRequest(body = {}) {
+  const { prompt, tier = "free", ragParams = {} } = body;
+
+  return {
+    prompt: validatePrompt(prompt),
+    tier: validateTier(tier),
+    ragParams: validateRagParams(ragParams),
+  };
+}
+
+// ==========================================================
+// Exports
+// ==========================================================
+
+module.exports = {
+  validatePrompt,
+  validateTier,
+  validateRagParams,
+  validateRequest,
+};
+=== utils\cacheKey.js ===
+"use strict";
+
+const crypto = require("crypto");
+const stableStringify = require("./stableStringify");
+
+/**
+ * ==========================================================
+ * Cache Key Generator
+ * ==========================================================
+ *
+ * Generates a deterministic SHA-256 hash that uniquely
+ * identifies an AI request.
+ *
+ * The cache key depends on:
+ *   1. User prompt
+ *   2. RAG parameters
+ *
+ * If either changes, a completely new cache key is produced.
+ */
+
+/**
+ * Creates a deterministic cache key.
+ *
+ * @param {string} prompt
+ * @param {Object} ragParams
+ * @returns {string}
+ */
+function generateCacheKey(prompt, ragParams = {}) {
+  const hash = crypto.createHash("sha256");
+
+  hash.update(prompt);
+  hash.update(":");
+  hash.update(stableStringify(ragParams));
+
+  return hash.digest("hex");
+}
+
+module.exports = generateCacheKey;
+=== utils\logger.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Simple Structured Logger
+ * ==========================================================
+ *
+ * Provides consistent application logging.
+ *
+ * This implementation intentionally avoids external
+ * dependencies. It can later be replaced by Winston,
+ * Pino, or another logging library without changing
+ * the rest of the application.
+ */
+
+function log(level, message, metadata = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...metadata,
+  };
+
+  const serialized = JSON.stringify(entry);
+
+  switch (level) {
+    case "ERROR":
+      console.error(serialized);
+      break;
+
+    case "WARN":
+      console.warn(serialized);
+      break;
+
+    default:
+      console.log(serialized);
+  }
+}
+
+module.exports = {
+  info(message, metadata) {
+    log("INFO", message, metadata);
+  },
+
+  warn(message, metadata) {
+    log("WARN", message, metadata);
+  },
+
+  error(message, metadata) {
+    log("ERROR", message, metadata);
+  },
+};
+=== utils\sse.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Server-Sent Events (SSE) Utilities
+ * ==========================================================
+ *
+ * This file contains helper functions for sending
+ * Server-Sent Events (SSE) responses to the client.
+ *
+ * By centralizing SSE logic here, controllers and services
+ * don't need to worry about HTTP header details or
+ * formatting SSE messages.
+ */
+
+// ==========================================================
+// SSE Response Headers
+// ==========================================================
+
+/**
+ * Sends the required HTTP headers for an SSE connection.
+ *
+ * @param {import("express").Response} res
+ * @param {"HIT"|"MISS"} cacheStatus
+ */
+function writeSseHeaders(res, cacheStatus) {
+  if (res.headersSent) {
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Cache-Status": cacheStatus,
+  });
+}
+
+// ==========================================================
+// SSE Data
+// ==========================================================
+
+/**
+ * Sends one SSE event to the client.
+ *
+ * Example output:
+ *
+ * data: {"text":"Hello","done":false}
+ *
+ *
+ * @param {import("express").Response} res
+ * @param {Object} payload
+ */
+function writeSseData(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+// ==========================================================
+// SSE Completion
+// ==========================================================
+
+/**
+ * Sends the final completion event and closes
+ * the HTTP connection.
+ *
+ * @param {import("express").Response} res
+ */
+function finishSseStream(res) {
+  writeSseData(res, {
+    done: true,
+  });
+
+  res.end();
+}
+
+// ==========================================================
+// SSE Error
+// ==========================================================
+
+/**
+ * Sends an SSE error event.
+ *
+ * Used when headers have already been sent and
+ * we cannot switch to a normal JSON response.
+ *
+ * @param {import("express").Response} res
+ * @param {string} message
+ */
+function writeSseError(res, message) {
+  writeSseData(res, {
+    error: message,
+  });
+
+  res.end();
+}
+
+// ==========================================================
+// Exports
+// ==========================================================
+
+module.exports = {
+  writeSseHeaders,
+  writeSseData,
+  finishSseStream,
+  writeSseError,
+};
+=== utils\stableStringify.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Stable JSON Serializer
+ * ==========================================================
+ *
+ * JSON.stringify() depends on the order of object keys.
+ * This utility sorts object keys recursively before
+ * serializing them, ensuring deterministic output.
+ *
+ * Example:
+ *
+ * { a: 1, b: 2 }
+ *
+ * and
+ *
+ * { b: 2, a: 1 }
+ *
+ * will always produce the same string.
+ */
+
+/**
+ * Recursively serializes any JavaScript value into a
+ * deterministic JSON string.
+ *
+ * @param {*} value
+ * @returns {string}
+ */
+function stableStringify(value) {
+  // Primitive values
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  // Arrays (preserve order)
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+
+  // Objects (sort keys)
+  const sortedKeys = Object.keys(value).sort();
+
+  const serializedPairs = sortedKeys.map((key) => {
+    return `${JSON.stringify(key)}:${stableStringify(value[key])}`;
+  });
+
+  return `{${serializedPairs.join(",")}}`;
+}
+
+module.exports = stableStringify;
+=== utils\tokenEstimator.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Token Estimator
+ * ==========================================================
+ *
+ * Provides a lightweight approximation of the number of
+ * LLM tokens contained in a prompt.
+ *
+ * NOTE:
+ * This is NOT an exact tokenizer.
+ * It is only used for task scheduling and priority
+ * calculation inside the AI Gateway.
+ *
+ * Production systems often use tokenizer libraries such as:
+ * - tiktoken (OpenAI)
+ * - sentencepiece
+ * - Hugging Face tokenizers
+ */
+
+/**
+ * Estimates the approximate number of LLM tokens.
+ *
+ * Strategy:
+ * 1. Remove leading/trailing whitespace.
+ * 2. Split the text into words.
+ * 3. Multiply by 1.3 because English words average
+ *    about 1.3 LLM tokens.
+ *
+ * @param {string} text
+ * @returns {number}
+ */
+function estimateTokenLength(text) {
+  if (typeof text !== "string") {
+    return 0;
+  }
+
+  const trimmedText = text.trim();
+
+  if (trimmedText.length === 0) {
+    return 0;
+  }
+
+  const wordCount = trimmedText.split(/\s+/).length;
+
+  return Math.ceil(wordCount * 1.3);
+}
+
+module.exports = estimateTokenLength;
+=== utils\workerHelpers.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Worker Helper Utilities
+ * ==========================================================
+ *
+ * Helpers related to task cancellation.
+ *
+ * This file does NOT manage workers.
+ */
+
+function cleanupAbortedTask({
+  gatewayQueue,
+  activeTaskRegistry,
+  task,
+  abortController,
+}) {
+  if (abortController.signal.aborted) {
+    return;
+  }
+
+  abortController.abort();
+
+  gatewayQueue.removeTaskById(task.id);
+
+  activeTaskRegistry.remove(task.id);
+}
+
+module.exports = {
+  cleanupAbortedTask,
+};
+=== worker\GatewayWorkerPool.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Gateway Worker Pool
+ * ==========================================================
+ *
+ * Responsible ONLY for limiting concurrent execution.
+ *
+ * Responsibilities:
+ * 1. Acquire worker slots
+ * 2. Release worker slots
+ * 3. Report worker availability
+ *
+ * This class intentionally does NOT know:
+ * - Tasks
+ * - Queues
+ * - Express
+ * - Streaming
+ * - Active task registry
+ */
+
+class GatewayWorkerPool {
+  constructor(maxWorkers = 4) {
+    if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
+      throw new Error("maxWorkers must be a positive integer.");
+    }
+
+    this.maxWorkers = maxWorkers;
+    this.activeWorkers = 0;
+  }
+
+  acquireWorkerSlot() {
+    if (!this.hasAvailableWorker()) {
+      throw new Error("No worker slots available.");
+    }
+
+    this.activeWorkers++;
+  }
+
+  releaseWorkerSlot() {
+    if (this.activeWorkers > 0) {
+      this.activeWorkers--;
+    }
+  }
+
+  hasAvailableWorker() {
+    return this.activeWorkers < this.maxWorkers;
+  }
+
+  activeWorkerCount() {
+    return this.activeWorkers;
+  }
+
+  availableWorkerCount() {
+    return this.maxWorkers - this.activeWorkers;
+  }
+
+  clear() {
+    this.activeWorkers = 0;
+  }
+}
+
+module.exports = GatewayWorkerPool;
+=== worker\ActiveTaskRegistry.js ===
+"use strict";
+
+/**
+ * ==========================================================
+ * Active Task Registry
+ * ==========================================================
+ *
+ * Responsible ONLY for tracking tasks that are currently
+ * executing inside the gateway.
+ *
+ * Responsibilities:
+ * 1. Register active tasks
+ * 2. Remove completed tasks
+ * 3. Lookup active tasks
+ *
+ * This class knows NOTHING about:
+ * - Worker capacity
+ * - Queues
+ * - Express
+ * - Streaming
+ */
+
+class ActiveTaskRegistry {
+  constructor() {
+    this.tasks = new Map();
+  }
+
+  register(task) {
+    if (!task || !task.id) {
+      throw new Error("Task must have an id.");
+    }
+
+    this.tasks.set(task.id, task);
+  }
+
+  remove(taskId) {
+    return this.tasks.delete(taskId);
+  }
+
+  get(taskId) {
+    return this.tasks.get(taskId);
+  }
+
+  has(taskId) {
+    return this.tasks.has(taskId);
+  }
+
+  size() {
+    return this.tasks.size;
+  }
+
+  clear() {
+    this.tasks.clear();
+  }
+}
+
+module.exports = ActiveTaskRegistry;
+=== queue\GatewayPriorityQueue.js ===
+"use strict";
+
+const logger = require("../utils/logger");
+
+/**
+ * ==========================================================
+ * Gateway Priority Queue
+ * ==========================================================
+ *
+ * Responsibilities:
+ *
+ * 1. Store queued tasks
+ * 2. Sort tasks by priority
+ * 3. Preserve FIFO for equal priorities
+ * 4. Execute tasks when workers are available
+ * 5. Manage worker lifecycle
+ *
+ * This class knows NOTHING about:
+ * - Express
+ * - HTTP
+ * - Validation
+ * - Streaming internals
+ * - AI Models
+ */
+
+class GatewayPriorityQueue {
+  constructor({ workerPool, activeTaskRegistry }) {
+    if (!workerPool) {
+      throw new Error("Worker pool is required.");
+    }
+
+    if (!activeTaskRegistry) {
+      throw new Error("Active task registry is required.");
+    }
+
+    this.workerPool = workerPool;
+    this.activeTaskRegistry = activeTaskRegistry;
+
+    this.queue = [];
+    this.sequence = 0;
+
+    this.processing = false;
+  }
+
+  // ========================================================
+  // Queue Information
+  // ========================================================
+
+  size() {
+    return this.queue.length;
+  }
+
+  isEmpty() {
+    return this.queue.length === 0;
+  }
+
+  peek() {
+    return this.queue[0];
+  }
+
+  // ========================================================
+  // Enqueue
+  // ========================================================
+
+  enqueue(task) {
+    if (!task || typeof task.execute !== "function") {
+      throw new Error("Invalid task.");
+    }
+
+    this.queue.push({
+      ...task,
+      sequence: this.sequence++,
+    });
+
+    this.sortQueue();
+
+    void this.processQueue();
+  }
+
+  // ========================================================
+  // Queue Sorting
+  // ========================================================
+
+  sortQueue() {
+    this.queue.sort((a, b) => {
+      if (a.weight !== b.weight) {
+        return a.weight - b.weight;
+      }
+
+      return a.sequence - b.sequence;
+    });
+  }
+
+  // ========================================================
+  // Dequeue
+  // ========================================================
+
+  dequeue() {
+    return this.queue.shift();
+  }
+
+  // ========================================================
+  // Remove Waiting Task
+  // ========================================================
+
+  removeTaskById(taskId) {
+    const index = this.queue.findIndex((task) => task.id === taskId);
+
+    if (index === -1) {
+      return false;
+    }
+
+    this.queue.splice(index, 1);
+
+    return true;
+  }
+
+  // ========================================================
+  // Queue Processing
+  // ========================================================
+
+  async processQueue() {
+    if (this.processing) {
+      return;
+    }
+
+    this.processing = true;
+
+    try {
+      while (!this.isEmpty() && this.workerPool.hasAvailableWorker()) {
+        const task = this.dequeue();
+
+        this.workerPool.acquireWorkerSlot();
+        this.activeTaskRegistry.register(task);
+
+        try {
+          await task.execute();
+        } catch (error) {
+          // Temporary logging.
+          // Design Problem 5 will replace this with
+          // a structured logger.
+
+          logger.error("Task execution failed", {
+            taskId: task.id,
+            error: error.message,
+            stack: error.stack,
+          });
+        } finally {
+          this.activeTaskRegistry.remove(task.id);
+
+          this.workerPool.releaseWorkerSlot();
+        }
+      }
+    } finally {
+      this.processing = false;
+
+      if (!this.isEmpty() && this.workerPool.hasAvailableWorker()) {
+        void this.processQueue();
+      }
+    }
+  }
+}
+
+module.exports = GatewayPriorityQueue;
+=== tests\activeTaskRegistry.test.js ===
+"use strict";
+
+const ActiveTaskRegistry = require("../worker/ActiveTaskRegistry");
+
+describe("ActiveTaskRegistry", () => {
+  let registry;
+
+  beforeEach(() => {
+    registry = new ActiveTaskRegistry();
+  });
+
+  // ========================================================
+  // Constructor
+  // ========================================================
+
+  test("starts empty", () => {
+    expect(registry.size()).toBe(0);
+  });
+
+  // ========================================================
+  // Register
+  // ========================================================
+
+  describe("register()", () => {
+    test("registers a task", () => {
+      const task = {
+        id: "task-1",
+        execute: jest.fn(),
+      };
+
+      registry.register(task);
+
+      expect(registry.size()).toBe(1);
+    });
+
+    test("rejects task without id", () => {
+      expect(() => {
+        registry.register({});
+      }).toThrow("Task must have an id.");
+    });
+  });
+
+  // ========================================================
+  // Lookup
+  // ========================================================
+
+  describe("lookup", () => {
+    const task = {
+      id: "task-1",
+      execute: jest.fn(),
+    };
+
+    beforeEach(() => {
+      registry.register(task);
+    });
+
+    test("gets task", () => {
+      expect(registry.get("task-1")).toEqual(task);
+    });
+
+    test("returns undefined for missing task", () => {
+      expect(registry.get("missing")).toBeUndefined();
+    });
+
+    test("checks task existence", () => {
+      expect(registry.has("task-1")).toBe(true);
+      expect(registry.has("missing")).toBe(false);
+    });
+  });
+
+  // ========================================================
+  // Remove
+  // ========================================================
+
+  describe("remove()", () => {
+    test("removes existing task", () => {
+      registry.register({
+        id: "task-1",
+        execute: jest.fn(),
+      });
+
+      expect(registry.remove("task-1")).toBe(true);
+      expect(registry.size()).toBe(0);
+    });
+
+    test("returns false for missing task", () => {
+      expect(registry.remove("missing")).toBe(false);
+    });
+  });
+
+  // ========================================================
+  // Clear
+  // ========================================================
+
+  describe("clear()", () => {
+    test("clears registry", () => {
+      registry.register({
+        id: "1",
+        execute: jest.fn(),
+      });
+
+      registry.register({
+        id: "2",
+        execute: jest.fn(),
+      });
+
+      registry.clear();
+
+      expect(registry.size()).toBe(0);
+    });
+  });
+});
+=== tests\cache.test.js ===
+"use strict";
+
+const {
+  buildCacheKey,
+  getCachedResponse,
+  storeResponse,
+  tryServeCachedResponse,
+} = require("../services/cacheService");
+
+describe("Cache Service", () => {
+  let cache;
+
+  beforeEach(() => {
+    cache = {
+      store: new Map(),
+
+      get(key) {
+        return this.store.get(key);
+      },
+
+      put(key, value) {
+        this.store.set(key, value);
+      },
+    };
+  });
+
+  // ========================================================
+  // Cache Key Generation
+  // ========================================================
+
+  describe("buildCacheKey()", () => {
+    test("returns deterministic keys", () => {
+      const key1 = buildCacheKey("Hello", { topK: 5 });
+
+      const key2 = buildCacheKey("Hello", { topK: 5 });
+
+      expect(key1).toBe(key2);
+    });
+
+    test("changes when prompt changes", () => {
+      const key1 = buildCacheKey("Hello", {});
+
+      const key2 = buildCacheKey("Hi", {});
+
+      expect(key1).not.toBe(key2);
+    });
+
+    test("changes when rag parameters change", () => {
+      const key1 = buildCacheKey("Hello", { topK: 5 });
+
+      const key2 = buildCacheKey("Hello", { topK: 10 });
+
+      expect(key1).not.toBe(key2);
+    });
+
+    test("ignores object key order", () => {
+      const key1 = buildCacheKey("Hello", {
+        topK: 5,
+        temperature: 0.2,
+      });
+
+      const key2 = buildCacheKey("Hello", {
+        temperature: 0.2,
+        topK: 5,
+      });
+
+      expect(key1).toBe(key2);
+    });
+  });
+
+  // ========================================================
+  // Cache Storage
+  // ========================================================
+
+  describe("storeResponse()", () => {
+    test("stores response", () => {
+      storeResponse(cache, "abc", "AI Response");
+
+      expect(cache.get("abc")).toBe("AI Response");
+    });
+  });
+
+  // ========================================================
+  // Cache Lookup
+  // ========================================================
+
+  describe("getCachedResponse()", () => {
+    test("returns cached response", () => {
+      cache.put("abc", "cached");
+
+      expect(getCachedResponse(cache, "abc")).toBe("cached");
+    });
+
+    test("returns undefined for missing key", () => {
+      expect(getCachedResponse(cache, "missing")).toBeUndefined();
+    });
+  });
+
+  // ========================================================
+  // Cache Hit
+  // ========================================================
+
+  describe("tryServeCachedResponse()", () => {
+    let res;
+
+    beforeEach(() => {
+      res = {
+        headers: {},
+        body: "",
+
+        setHeader(name, value) {
+          this.headers[name] = value;
+        },
+
+        writeHead(status, headers) {
+          this.statusCode = status;
+          this.headers = {
+            ...this.headers,
+            ...headers,
+          };
+        },
+
+        write(chunk) {
+          this.body += chunk;
+        },
+
+        end() {},
+      };
+    });
+
+    test("returns false on cache miss", () => {
+      const served = tryServeCachedResponse({
+        cache,
+        cacheKey: "missing",
+        res,
+      });
+
+      expect(served).toBe(false);
+    });
+
+    test("returns true on cache hit", () => {
+      cache.put("key", "cached response");
+
+      const served = tryServeCachedResponse({
+        cache,
+        cacheKey: "key",
+        res,
+      });
+
+      expect(served).toBe(true);
+    });
+
+    test("sets cache header", () => {
+      cache.put("key", "cached response");
+
+      tryServeCachedResponse({
+        cache,
+        cacheKey: "key",
+        res,
+      });
+
+      expect(res.headers["X-Cache-Status"]).toBe("HIT");
+    });
+
+    test("writes cached response", () => {
+      cache.put("key", "cached response");
+
+      tryServeCachedResponse({
+        cache,
+        cacheKey: "key",
+        res,
+      });
+
+      expect(res.body).toContain("cached response");
+    });
+
+    test("marks stream complete", () => {
+      cache.put("key", "cached response");
+
+      tryServeCachedResponse({
+        cache,
+        cacheKey: "key",
+        res,
+      });
+
+      expect(res.body).toContain('"done":true');
+    });
+  });
+});
+=== tests\controller.test.js ===
+"use strict";
+
+const createAiController = require("../controllers/aiController");
+
+const validationService = require("../services/validationService");
+const cacheService = require("../services/cacheService");
+const taskFactory = require("../services/taskFactory");
+const workerHelpers = require("../utils/workerHelpers");
+
+jest.mock("../services/validationService");
+jest.mock("../services/cacheService");
+jest.mock("../services/taskFactory");
+jest.mock("../utils/workerHelpers");
+
+describe("AI Controller", () => {
+  let gatewayQueue;
+  let cache;
+  let activeTaskRegistry;
+
+  let controller;
+
+  let req;
+  let res;
+  let next;
+
+  beforeEach(() => {
+    gatewayQueue = {
+      enqueue: jest.fn(),
+    };
+
+    cache = {};
+
+    activeTaskRegistry = {};
+
+    controller = createAiController({
+      gatewayQueue,
+      cache,
+      activeTaskRegistry,
+    });
+
+    req = {
+      body: {},
+      on: jest.fn(),
+    };
+
+    res = {};
+
+    next = jest.fn();
+
+    jest.clearAllMocks();
+  });
+
+  // ========================================================
+  // Successful Request
+  // ========================================================
+
+  describe("successful request", () => {
+    test("creates and enqueues task", async () => {
+      validationService.validateRequest.mockReturnValue({
+        prompt: "Hello",
+        tier: "free",
+        ragParams: {},
+      });
+
+      cacheService.buildCacheKey.mockReturnValue("cache-key");
+
+      cacheService.tryServeCachedResponse.mockReturnValue(false);
+
+      const task = {
+        id: "task-1",
+      };
+
+      taskFactory.createGatewayTask.mockReturnValue(task);
+
+      await controller(req, res, next);
+
+      expect(taskFactory.createGatewayTask).toHaveBeenCalled();
+
+      expect(gatewayQueue.enqueue).toHaveBeenCalledWith(task);
+
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    test("registers disconnect handler", async () => {
+      validationService.validateRequest.mockReturnValue({
+        prompt: "Hello",
+        tier: "free",
+        ragParams: {},
+      });
+
+      cacheService.buildCacheKey.mockReturnValue("key");
+
+      cacheService.tryServeCachedResponse.mockReturnValue(false);
+
+      taskFactory.createGatewayTask.mockReturnValue({
+        id: "task",
+      });
+
+      await controller(req, res, next);
+
+      expect(req.on).toHaveBeenCalledWith("close", expect.any(Function));
+    });
+  });
+
+  // ========================================================
+  // Cache
+  // ========================================================
+
+  describe("cache hit", () => {
+    test("does not enqueue task", async () => {
+      validationService.validateRequest.mockReturnValue({
+        prompt: "Hello",
+        tier: "free",
+        ragParams: {},
+      });
+
+      cacheService.buildCacheKey.mockReturnValue("key");
+
+      cacheService.tryServeCachedResponse.mockReturnValue(true);
+
+      await controller(req, res, next);
+
+      expect(taskFactory.createGatewayTask).not.toHaveBeenCalled();
+
+      expect(gatewayQueue.enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  // ========================================================
+  // Disconnect Handler
+  // ========================================================
+
+  describe("disconnect handler", () => {
+    test("invokes cleanup helper", async () => {
+      validationService.validateRequest.mockReturnValue({
+        prompt: "Hello",
+        tier: "free",
+        ragParams: {},
+      });
+
+      cacheService.buildCacheKey.mockReturnValue("key");
+
+      cacheService.tryServeCachedResponse.mockReturnValue(false);
+
+      const task = {
+        id: "task-1",
+      };
+
+      taskFactory.createGatewayTask.mockReturnValue(task);
+
+      await controller(req, res, next);
+
+      const closeHandler = req.on.mock.calls[0][1];
+
+      closeHandler();
+
+      expect(workerHelpers.cleanupAbortedTask).toHaveBeenCalled();
+    });
+  });
+
+  // ========================================================
+  // Error Handling
+  // ========================================================
+
+  describe("error handling", () => {
+    test("passes validation errors to next()", async () => {
+      const error = new Error("Validation failed");
+
+      validationService.validateRequest.mockImplementation(() => {
+        throw error;
+      });
+
+      await controller(req, res, next);
+
+      expect(next).toHaveBeenCalledWith(error);
+    });
+
+    test("passes task creation errors to next()", async () => {
+      validationService.validateRequest.mockReturnValue({
+        prompt: "Hello",
+        tier: "free",
+        ragParams: {},
+      });
+
+      cacheService.buildCacheKey.mockReturnValue("key");
+
+      cacheService.tryServeCachedResponse.mockReturnValue(false);
+
+      const error = new Error("Task failure");
+
+      taskFactory.createGatewayTask.mockImplementation(() => {
+        throw error;
+      });
+
+      await controller(req, res, next);
+
+      expect(next).toHaveBeenCalledWith(error);
+    });
+  });
+});
+=== tests\integration.test.js ===
+"use strict";
+
+const { PassThrough } = require("stream");
+const request = require("supertest");
+const nock = require("nock");
+
+const app = require("../app");
+
+describe("AI Gateway Integration", () => {
+  afterEach(() => {
+    nock.cleanAll();
+  });
+
+  afterAll(() => {
+    nock.restore();
+  });
+
+  // =======================================================
+  // Health
+  // =======================================================
+
+  test("GET /health returns healthy", async () => {
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+
+    expect(response.body).toEqual({
+      status: "healthy",
+    });
+  });
+
+  // =======================================================
+  // Validation
+  // =======================================================
+
+  test("rejects invalid request", async () => {
+    const response = await request(app).post("/api/ai/generate").send({});
+
+    expect(response.status).toBe(400);
+  });
+
+  // =======================================================
+  // Successful Stream
+  // =======================================================
+
+  test("streams successful AI response", async () => {
+    const stream = new PassThrough();
+
+    stream.end("Hello AI");
+
+    nock("http://localhost:5001")
+      .post("/stream")
+      .reply(200, () => stream);
+
+    const response = await request(app).post("/api/ai/generate").send({
+      prompt: "Hello",
+    });
+
+    expect(response.status).toBe(200);
+  });
+
+  // =======================================================
+  // Cache
+  // =======================================================
+
+  test("serves cached response on second request", async () => {
+    const stream = new PassThrough();
+
+    stream.end("Cached Response");
+
+    nock("http://localhost:5001")
+      .post("/stream")
+      .once()
+      .reply(200, () => stream);
+
+    await request(app).post("/api/ai/generate").send({
+      prompt: "Hello",
+    });
+
+    const response = await request(app).post("/api/ai/generate").send({
+      prompt: "Hello",
+    });
+
+    expect(response.status).toBe(200);
+
+    expect(response.headers["x-cache-status"]).toBe("HIT");
+  });
+
+  // =======================================================
+  // Python Failure
+  // =======================================================
+
+  test("returns gateway failure if python service fails", async () => {
+    nock("http://localhost:5001")
+      .post("/stream")
+      .replyWithError("Python Offline");
+
+    const response = await request(app).post("/api/ai/generate").send({
+      prompt: "Hello",
+    });
+
+    expect(response.status).toBe(500);
+  });
+});
+=== tests\queue.test.js ===
+"use strict";
+
+const GatewayPriorityQueue = require("../queue/GatewayPriorityQueue");
+const GatewayWorkerPool = require("../worker/GatewayWorkerPool");
+const ActiveTaskRegistry = require("../worker/ActiveTaskRegistry");
+
+describe("GatewayPriorityQueue", () => {
+  let workerPool;
+  let activeTaskRegistry;
+  let queue;
+
+  beforeEach(() => {
+    workerPool = new GatewayWorkerPool(2);
+
+    activeTaskRegistry = new ActiveTaskRegistry();
+
+    queue = new GatewayPriorityQueue({
+      workerPool,
+      activeTaskRegistry,
+    });
+  });
+
+  // ========================================================
+  // Constructor
+  // ========================================================
+
+  describe("constructor()", () => {
+    test("creates empty queue", () => {
+      expect(queue.size()).toBe(0);
+      expect(queue.isEmpty()).toBe(true);
+    });
+
+    test("requires worker pool", () => {
+      expect(() => {
+        new GatewayPriorityQueue({
+          activeTaskRegistry,
+        });
+      }).toThrow("Worker pool is required.");
+    });
+
+    test("requires active task registry", () => {
+      expect(() => {
+        new GatewayPriorityQueue({
+          workerPool,
+        });
+      }).toThrow("Active task registry is required.");
+    });
+  });
+
+  // ========================================================
+  // Enqueue
+  // ========================================================
+
+  describe("enqueue()", () => {
+    test("rejects invalid task", () => {
+      expect(() => {
+        queue.enqueue({});
+      }).toThrow("Invalid task.");
+    });
+
+    test("executes valid task", async () => {
+      const execute = jest.fn();
+
+      queue.enqueue({
+        id: "task-1",
+        weight: 1,
+        execute,
+      });
+
+      await Promise.resolve();
+
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ========================================================
+  // Priority
+  // ========================================================
+
+  describe("priority ordering", () => {
+    test("lower weight executes first", async () => {
+      const order = [];
+
+      queue.enqueue({
+        id: "high",
+        weight: 1,
+        execute: jest.fn(() => order.push("high")),
+      });
+
+      queue.enqueue({
+        id: "low",
+        weight: 10,
+        execute: jest.fn(() => order.push("low")),
+      });
+
+      await Promise.resolve();
+
+      expect(order).toEqual(["high", "low"]);
+    });
+
+    test("preserves FIFO for equal priorities", async () => {
+      const order = [];
+
+      queue.enqueue({
+        id: "one",
+        weight: 5,
+        execute: jest.fn(() => order.push("one")),
+      });
+
+      queue.enqueue({
+        id: "two",
+        weight: 5,
+        execute: jest.fn(() => order.push("two")),
+      });
+
+      await Promise.resolve();
+
+      expect(order).toEqual(["one", "two"]);
+    });
+  });
+
+  // ========================================================
+  // Queue Helpers
+  // ========================================================
+
+  describe("queue helpers", () => {
+    test("peek returns undefined when empty", () => {
+      expect(queue.peek()).toBeUndefined();
+    });
+
+    test("dequeue returns first task", () => {
+      const task = {
+        id: "task",
+        weight: 1,
+        execute: jest.fn(),
+      };
+
+      queue.queue.push(task);
+
+      expect(queue.dequeue()).toEqual(task);
+      expect(queue.isEmpty()).toBe(true);
+    });
+
+    test("removes queued task by id", () => {
+      queue.queue.push({
+        id: "remove-me",
+        weight: 1,
+        execute: jest.fn(),
+      });
+
+      expect(queue.removeTaskById("remove-me")).toBe(true);
+      expect(queue.size()).toBe(0);
+    });
+
+    test("returns false for missing task", () => {
+      expect(queue.removeTaskById("missing")).toBe(false);
+    });
+  });
+
+  // ========================================================
+  // Worker Lifecycle
+  // ========================================================
+
+  describe("worker lifecycle", () => {
+    test("releases worker after successful execution", async () => {
+      queue.enqueue({
+        id: "task",
+        weight: 1,
+        execute: jest.fn(),
+      });
+
+      await Promise.resolve();
+
+      expect(workerPool.activeWorkerCount()).toBe(0);
+      expect(workerPool.availableWorkerCount()).toBe(2);
+    });
+
+    test("releases worker after failed execution", async () => {
+      queue.enqueue({
+        id: "task",
+        weight: 1,
+        execute: jest.fn(() => {
+          throw new Error("failure");
+        }),
+      });
+
+      await Promise.resolve();
+
+      expect(workerPool.activeWorkerCount()).toBe(0);
+      expect(workerPool.availableWorkerCount()).toBe(2);
+    });
+  });
+
+  // ========================================================
+  // Active Task Registry
+  // ========================================================
+
+  describe("active task registry", () => {
+    test("registry is empty after successful execution", async () => {
+      queue.enqueue({
+        id: "task",
+        weight: 1,
+        execute: jest.fn(),
+      });
+
+      await Promise.resolve();
+
+      expect(activeTaskRegistry.size()).toBe(0);
+    });
+
+    test("registry is empty after failed execution", async () => {
+      queue.enqueue({
+        id: "task",
+        weight: 1,
+        execute: jest.fn(() => {
+          throw new Error("failure");
+        }),
+      });
+
+      await Promise.resolve();
+
+      expect(activeTaskRegistry.size()).toBe(0);
+    });
+  });
+});
+=== tests\streaming.test.js ===
+"use strict";
+
+const { PassThrough } = require("stream");
+const axios = require("axios");
+
+const { streamPythonResponse } = require("../services/streamService");
+
+jest.mock("axios");
+
+describe("Stream Service", () => {
+  let cache;
+  let res;
+  let abortController;
+
+  beforeEach(() => {
+    cache = {
+      store: new Map(),
+
+      get(key) {
+        return this.store.get(key);
+      },
+
+      put(key, value) {
+        this.store.set(key, value);
+      },
+    };
+
+    res = {
+      headers: {},
+      body: "",
+      headersSent: false,
+
+      writeHead(status, headers) {
+        this.headersSent = true;
+        this.statusCode = status;
+        this.headers = {
+          ...this.headers,
+          ...headers,
+        };
+      },
+
+      write(chunk) {
+        this.body += chunk;
+      },
+
+      end() {
+        this.ended = true;
+      },
+
+      status: jest.fn(function (code) {
+        this.statusCode = code;
+        return this;
+      }),
+
+      json: jest.fn(),
+    };
+
+    abortController = new AbortController();
+
+    jest.clearAllMocks();
+  });
+
+  // ========================================================
+  // Successful Streaming
+  // ========================================================
+
+  describe("successful streaming", () => {
+    test("streams response and stores it in cache", async () => {
+      const stream = new PassThrough();
+
+      axios.mockResolvedValue({
+        data: stream,
+      });
+
+      const promise = streamPythonResponse({
+        res,
+        prompt: "Hello",
+        ragParams: {},
+        cache,
+        cacheKey: "cache-key",
+        abortController,
+      });
+
+      stream.write("Hello ");
+      stream.write("World");
+      stream.end();
+
+      await promise;
+
+      expect(cache.get("cache-key")).toBe("Hello World");
+
+      expect(res.body).toContain("Hello");
+      expect(res.body).toContain("World");
+
+      expect(res.ended).toBe(true);
+    });
+
+    test("writes cache miss header", async () => {
+      const stream = new PassThrough();
+
+      axios.mockResolvedValue({
+        data: stream,
+      });
+
+      const promise = streamPythonResponse({
+        res,
+        prompt: "Hello",
+        ragParams: {},
+        cache,
+        cacheKey: "key",
+        abortController,
+      });
+
+      stream.end();
+
+      await promise;
+
+      expect(res.headers["X-Cache-Status"]).toBe("MISS");
+    });
+
+    test("marks stream complete", async () => {
+      const stream = new PassThrough();
+
+      axios.mockResolvedValue({
+        data: stream,
+      });
+
+      const promise = streamPythonResponse({
+        res,
+        prompt: "Hello",
+        ragParams: {},
+        cache,
+        cacheKey: "key",
+        abortController,
+      });
+
+      stream.end();
+
+      await promise;
+
+      expect(res.body).toContain('"done":true');
+    });
+  });
+
+  // ========================================================
+  // Abort
+  // ========================================================
+
+  describe("abort", () => {
+    test("returns silently after cancellation", async () => {
+      abortController.abort();
+
+      axios.mockRejectedValue({
+        name: "CanceledError",
+      });
+
+      await expect(
+        streamPythonResponse({
+          res,
+          prompt: "Hello",
+          ragParams: {},
+          cache,
+          cacheKey: "key",
+          abortController,
+        }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  // // ========================================================
+  // // Failure
+  // // ========================================================
+
+  // describe("failure", () => {
+  //   test("writes SSE error after headers are sent", async () => {
+  //     axios.mockRejectedValue(new Error("Python unavailable"));
+
+  //     await streamPythonResponse({
+  //       res,
+  //       prompt: "Hello",
+  //       ragParams: {},
+  //       cache,
+  //       cacheKey: "key",
+  //       abortController,
+  //     });
+
+  //     expect(res.status).toHaveBeenCalledWith(500);
+
+  //     expect(res.json).toHaveBeenCalledWith({
+  //       error: "Streaming gateway processing failure.",
+  //     });
+  //   });
+
+  //   test("writes SSE error after headers are sent", async () => {
+  //     res.headersSent = true;
+
+  //     axios.mockRejectedValue(new Error("Failure"));
+
+  //     await expect(
+  //       streamPythonResponse({
+  //         res,
+  //         prompt: "Hello",
+  //         ragParams: {},
+  //         cache,
+  //         cacheKey: "key",
+  //         abortController,
+  //       }),
+  //     ).rejects.toThrow("Python unavailable");
+
+  //     expect(res.body).toContain("Streaming gateway processing failure.");
+  //   });
+  // });
+
+  // ========================================================
+  // Cache
+  // ========================================================
+
+  describe("cache", () => {
+    test("stores complete streamed response", async () => {
+      const stream = new PassThrough();
+
+      axios.mockResolvedValue({
+        data: stream,
+      });
+
+      const promise = streamPythonResponse({
+        res,
+        prompt: "Prompt",
+        ragParams: {},
+        cache,
+        cacheKey: "response",
+        abortController,
+      });
+
+      stream.write("Part 1 ");
+      stream.write("Part 2 ");
+      stream.write("Part 3");
+
+      stream.end();
+
+      await promise;
+
+      expect(cache.get("response")).toBe("Part 1 Part 2 Part 3");
+    });
+
+    test("does not cache aborted response", async () => {
+      const stream = new PassThrough();
+
+      axios.mockResolvedValue({
+        data: stream,
+      });
+
+      const promise = streamPythonResponse({
+        res,
+        prompt: "Prompt",
+        ragParams: {},
+        cache,
+        cacheKey: "response",
+        abortController,
+      });
+
+      stream.write("Partial");
+
+      abortController.abort();
+
+      stream.end();
+
+      await promise;
+
+      expect(cache.get("response")).toBeUndefined();
+    });
+  });
+});
+=== tests\validation.test.js ===
+"use strict";
+
+const {
+  validatePrompt,
+  validateTier,
+  validateRagParams,
+  validateRequest,
+} = require("../services/validationService");
+
+describe("Validation Service", () => {
+  // ========================================================
+  // Prompt Validation
+  // ========================================================
+
+  describe("validatePrompt()", () => {
+    test("accepts a valid prompt", () => {
+      expect(validatePrompt("Hello AI")).toBe("Hello AI");
+    });
+
+    test("trims surrounding whitespace", () => {
+      expect(validatePrompt("   Hello AI   ")).toBe("Hello AI");
+    });
+
+    test("rejects empty prompt", () => {
+      expect(() => validatePrompt("     ")).toThrow("Prompt cannot be empty.");
+    });
+
+    test("rejects non-string prompt", () => {
+      expect(() => validatePrompt(123)).toThrow("Prompt must be a string.");
+    });
+
+    test("rejects oversized prompt", () => {
+      const prompt = "a".repeat(50001);
+
+      expect(() => validatePrompt(prompt)).toThrow(
+        "Prompt exceeds maximum allowed size.",
+      );
+    });
+  });
+
+  // ========================================================
+  // Tier Validation
+  // ========================================================
+
+  describe("validateTier()", () => {
+    test("accepts free tier", () => {
+      expect(validateTier("free")).toBe("free");
+    });
+
+    test("accepts premium tier", () => {
+      expect(validateTier("premium")).toBe("premium");
+    });
+
+    test("normalizes uppercase values", () => {
+      expect(validateTier("PREMIUM")).toBe("premium");
+    });
+
+    test("defaults to free", () => {
+      expect(validateTier()).toBe("free");
+    });
+
+    test("rejects unsupported tier", () => {
+      expect(() => validateTier("enterprise")).toThrow(
+        'Unsupported tier "enterprise".',
+      );
+    });
+  });
+
+  // ========================================================
+  // RAG Parameters
+  // ========================================================
+
+  describe("validateRagParams()", () => {
+    test("accepts empty object", () => {
+      expect(validateRagParams({})).toEqual({});
+    });
+
+    test("accepts populated object", () => {
+      const params = {
+        topK: 5,
+        temperature: 0.2,
+      };
+
+      expect(validateRagParams(params)).toEqual(params);
+    });
+
+    test("rejects arrays", () => {
+      expect(() => validateRagParams([])).toThrow(
+        "ragParams must be an object.",
+      );
+    });
+
+    test("rejects null", () => {
+      expect(() => validateRagParams(null)).toThrow(
+        "ragParams must be an object.",
+      );
+    });
+  });
+
+  // ========================================================
+  // Complete Request Validation
+  // ========================================================
+
+  describe("validateRequest()", () => {
+    test("returns cleaned request", () => {
+      const result = validateRequest({
+        prompt: " Hello ",
+        tier: "PREMIUM",
+        ragParams: {
+          topK: 3,
+        },
+      });
+
+      expect(result).toEqual({
+        prompt: "Hello",
+        tier: "premium",
+        ragParams: {
+          topK: 3,
+        },
+      });
+    });
+
+    test("uses default values", () => {
+      const result = validateRequest({
+        prompt: "AI",
+      });
+
+      expect(result).toEqual({
+        prompt: "AI",
+        tier: "free",
+        ragParams: {},
+      });
+    });
+
+    test("throws if prompt is invalid", () => {
+      expect(() =>
+        validateRequest({
+          prompt: "",
+        }),
+      ).toThrow("Prompt cannot be empty.");
+    });
+
+    test("throws if tier is invalid", () => {
+      expect(() =>
+        validateRequest({
+          prompt: "Hello",
+          tier: "gold",
+        }),
+      ).toThrow('Unsupported tier "gold".');
+    });
+
+    test("throws if ragParams is invalid", () => {
+      expect(() =>
+        validateRequest({
+          prompt: "Hello",
+          ragParams: [],
+        }),
+      ).toThrow("ragParams must be an object.");
+    });
+  });
+});
+=== tests\workerPool.test.js ===
+"use strict";
+
+const GatewayWorkerPool = require("../worker/GatewayWorkerPool");
+
+describe("GatewayWorkerPool", () => {
+  let workerPool;
+
+  beforeEach(() => {
+    workerPool = new GatewayWorkerPool(2);
+  });
+
+  // ========================================================
+  // Constructor
+  // ========================================================
+
+  describe("constructor()", () => {
+    test("creates worker pool", () => {
+      expect(workerPool.maxWorkers).toBe(2);
+      expect(workerPool.activeWorkerCount()).toBe(0);
+      expect(workerPool.availableWorkerCount()).toBe(2);
+    });
+
+    test("rejects zero workers", () => {
+      expect(() => {
+        new GatewayWorkerPool(0);
+      }).toThrow("maxWorkers must be a positive integer.");
+    });
+
+    test("rejects negative workers", () => {
+      expect(() => {
+        new GatewayWorkerPool(-1);
+      }).toThrow("maxWorkers must be a positive integer.");
+    });
+
+    test("rejects non-integer workers", () => {
+      expect(() => {
+        new GatewayWorkerPool(1.5);
+      }).toThrow("maxWorkers must be a positive integer.");
+    });
+  });
+
+  // ========================================================
+  // Worker Slot Acquisition
+  // ========================================================
+
+  describe("acquireWorkerSlot()", () => {
+    test("acquires one worker", () => {
+      workerPool.acquireWorkerSlot();
+
+      expect(workerPool.activeWorkerCount()).toBe(1);
+      expect(workerPool.availableWorkerCount()).toBe(1);
+    });
+
+    test("throws when pool is full", () => {
+      workerPool.acquireWorkerSlot();
+      workerPool.acquireWorkerSlot();
+
+      expect(() => {
+        workerPool.acquireWorkerSlot();
+      }).toThrow("No worker slots available.");
+    });
+  });
+
+  // ========================================================
+  // Worker Slot Release
+  // ========================================================
+
+  describe("releaseWorkerSlot()", () => {
+    test("releases worker", () => {
+      workerPool.acquireWorkerSlot();
+      workerPool.releaseWorkerSlot();
+
+      expect(workerPool.activeWorkerCount()).toBe(0);
+      expect(workerPool.availableWorkerCount()).toBe(2);
+    });
+
+    test("never releases below zero", () => {
+      workerPool.releaseWorkerSlot();
+
+      expect(workerPool.activeWorkerCount()).toBe(0);
+    });
+  });
+
+  // ========================================================
+  // Availability
+  // ========================================================
+
+  describe("availability", () => {
+    test("reports available workers", () => {
+      expect(workerPool.hasAvailableWorker()).toBe(true);
+
+      workerPool.acquireWorkerSlot();
+      workerPool.acquireWorkerSlot();
+
+      expect(workerPool.hasAvailableWorker()).toBe(false);
+    });
+
+    test("reports active worker count", () => {
+      workerPool.acquireWorkerSlot();
+
+      expect(workerPool.activeWorkerCount()).toBe(1);
+    });
+
+    test("reports available worker count", () => {
+      workerPool.acquireWorkerSlot();
+
+      expect(workerPool.availableWorkerCount()).toBe(1);
+    });
+  });
+
+  // ========================================================
+  // Reset
+  // ========================================================
+
+  describe("clear()", () => {
+    test("clears worker state", () => {
+      workerPool.acquireWorkerSlot();
+      workerPool.acquireWorkerSlot();
+
+      workerPool.clear();
+
+      expect(workerPool.activeWorkerCount()).toBe(0);
+      expect(workerPool.availableWorkerCount()).toBe(2);
+      expect(workerPool.hasAvailableWorker()).toBe(true);
+    });
+  });
+});
