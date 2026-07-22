@@ -26,12 +26,9 @@ function createGatewayTask({
   prompt,
   tier,
   ragParams,
-
   cache,
   cacheKey,
-
   res,
-
   abortController,
 }) {
   return {
