@@ -1,6 +1,15 @@
 """
 Day 32: Model Persistence, Checkpointing, and Evaluation Metrics
-First‑principles implementation of metric calculations and safe model serialization.
+
+This module provides two core capabilities:
+1. **MetricsCalculator** – computes classification metrics from scratch,
+   including confusion matrix, accuracy, precision, recall, F1, macro‑F1,
+   and micro‑F1. It handles edge cases like zero denominators gracefully.
+2. **ModelCheckpoint** – safely saves and loads training state (model weights,
+   optimizer state, epoch, metrics, and optional scheduler state) using atomic
+   file operations. All state is serialised to JSON (with NaN/Infinity rejected).
+
+These building blocks are essential for production‑ready training pipelines.
 """
 
 import json
@@ -11,19 +20,26 @@ from typing import Any
 
 class MetricsCalculator:
     """
-    Calculates multiclass classification metrics from ground truth and predictions.
+    Calculate multiclass classification metrics from ground truth and predictions.
 
-    All inputs must be finite sequences of integer class labels in [0, num_classes-1].
+    All inputs must be lists of integer class labels in [0, num_classes-1].
     Empty inputs raise ValueError – metrics are undefined for zero samples.
+
+    Example:
+        >>> calc = MetricsCalculator(num_classes=3)
+        >>> y_true = [0, 1, 2, 0]
+        >>> y_pred = [0, 1, 1, 0]
+        >>> calc.accuracy(y_true, y_pred)  # 3/4 = 0.75
     """
 
     def __init__(self, num_classes: int):
         """
         Args:
-            num_classes: Number of classes (>0).
+            num_classes: Number of classes (>0). Must be a positive integer.
         Raises:
             TypeError: If num_classes is not a positive integer (bool is rejected).
         """
+        # Reject booleans (they are subclasses of int but semantically wrong)
         if (
             not isinstance(num_classes, Integral)
             or isinstance(num_classes, bool)
@@ -33,15 +49,19 @@ class MetricsCalculator:
         self.num_classes = int(num_classes)
 
     def _validate_labels(self, y_true: list[int], y_pred: list[int]) -> None:
-        """Check lengths, non‑empty, and label bounds."""
+        """
+        Internal helper: check lengths, non‑emptiness, and label bounds.
+        Raises ValueError if anything is wrong.
+        """
         if len(y_true) != len(y_pred):
             raise ValueError("y_true and y_pred must have the same length.")
         if not y_true:
             raise ValueError("Input lists must not be empty.")
 
+        # Every label must be a valid integer in the allowed range
         for label in y_true + y_pred:
             if (
-                isinstance(label, bool)
+                isinstance(label, bool)  # bool is a subclass of int, but we reject it
                 or not isinstance(label, Integral)
                 or not (0 <= int(label) < self.num_classes)
             ):
@@ -51,31 +71,52 @@ class MetricsCalculator:
                 )
 
     def confusion_matrix(self, y_true: list[int], y_pred: list[int]) -> list[list[int]]:
-        """Build confusion matrix C where C[i][j] = count of (true=i, pred=j)."""
+        """
+        Build the confusion matrix.
+
+        Convention: C[i][j] = number of samples whose true class is i
+        and predicted class is j.  Rows = true, columns = predicted.
+
+        The matrix has shape (num_classes, num_classes).
+        """
         self._validate_labels(y_true, y_pred)
+
+        # Initialise a square matrix of zeros
         matrix = [[0] * self.num_classes for _ in range(self.num_classes)]
+
+        # Count each (true, predicted) pair
         for t, p in zip(y_true, y_pred):
             matrix[int(t)][int(p)] += 1
+
         return matrix
 
     def accuracy(self, y_true: list[int], y_pred: list[int]) -> float:
-        """Accuracy = sum(diag(C)) / sum(all C)."""
+        """
+        Compute accuracy = (correct predictions) / (total predictions).
+
+        This is equivalent to sum(diag(C)) / sum(all C).
+        """
         cm = self.confusion_matrix(y_true, y_pred)
         correct = sum(cm[i][i] for i in range(self.num_classes))
         total = sum(sum(row) for row in cm)
-        # total is guaranteed > 0 because confusion_matrix raises for empty
+        # total > 0 because we forbid empty inputs
         return correct / total
 
     def precision_recall_f1_per_class(
         self, y_true: list[int], y_pred: list[int]
     ) -> dict[int, dict[str, float]]:
         """
-        Per‑class precision, recall, F1.
+        Compute precision, recall, and F1 for each class.
 
-        For zero denominator:
-          - precision = 0.0  (no predicted positives)
-          - recall    = 0.0  (no actual positives)
-          - F1        = 0.0  (undefined, set to 0)
+        For each class k:
+          - TP_k = C[k][k]
+          - FP_k = sum(C[i][k] for i != k)
+          - FN_k = sum(C[k][j] for j != k)
+
+        Precision = TP / (TP + FP), Recall = TP / (TP + FN), F1 = 2*P*R/(P+R).
+
+        If the denominator is zero (no predictions or no true positives),
+        we return 0.0 for that metric. This is a common practical convention.
         """
         cm = self.confusion_matrix(y_true, y_pred)
         result = {}
@@ -99,17 +140,26 @@ class MetricsCalculator:
         return result
 
     def macro_f1(self, y_true: list[int], y_pred: list[int]) -> float:
-        """Unweighted average of per‑class F1 scores."""
+        """
+        Compute macro‑averaged F1: the unweighted mean of per‑class F1 scores.
+
+        Every class contributes equally, regardless of its support.
+        """
         per_class = self.precision_recall_f1_per_class(y_true, y_pred)
         return sum(metrics["f1"] for metrics in per_class.values()) / self.num_classes
 
     def micro_f1(self, y_true: list[int], y_pred: list[int]) -> float:
         """
-        Global F1 computed from total TP, FP, FN.
+        Compute micro‑averaged F1.
 
-        For ordinary single‑label multiclass, micro‑F1 == accuracy.
+        This aggregates total TP, FP, FN across all classes, then computes
+        F1 = 2*TP / (2*TP + FP + FN).
+
+        For ordinary single‑label multiclass classification, micro‑F1 equals
+        accuracy – a useful sanity check.
         """
         cm = self.confusion_matrix(y_true, y_pred)
+
         total_tp = sum(cm[k][k] for k in range(self.num_classes))
         total_fp = sum(
             sum(cm[i][k] for i in range(self.num_classes) if i != k)
@@ -121,20 +171,27 @@ class MetricsCalculator:
         )
 
         denom = 2 * total_tp + total_fp + total_fn
-        # denom > 0 because total samples > 0
+        # denom > 0 because we have at least one sample
         return (2 * total_tp) / denom
 
 
 class ModelCheckpoint:
     """
-    Atomically save / load training state (epoch, model, optimizer, metrics).
+    Safely save and load training checkpoints using atomic file operations.
 
-    Serialization uses JSON with allow_nan=False, so all state components must be
-    JSON‑serializable and contain no NaN/Infinity.
+    The checkpoint is a JSON file containing:
+      - epoch (int)
+      - model_state (dict)
+      - optimizer_state (dict)
+      - metrics (dict)
+      - scheduler_state (dict, optional)
 
-    You may optionally include scheduler_state for learning rate schedulers.
-    Exact resume requires that optimizer_state and scheduler_state contain all
-    internal state (e.g., Adam moments, ReduceLROnPlateau counters).
+    We use a temporary file + os.replace() to ensure that the target file
+    is never left in a partially written state – readers always see a
+    complete checkpoint or the previous one.
+
+    All state must be JSON‑serializable; we reject NaN/Infinity to keep
+    the data clean and portable.
     """
 
     @staticmethod
@@ -147,22 +204,27 @@ class ModelCheckpoint:
         scheduler_state: dict[str, Any] | None = None,
     ) -> None:
         """
-        Atomically save checkpoint.
+        Atomically save a checkpoint to `filepath`.
+
+        Steps:
+          1. Validate input types.
+          2. Build the checkpoint dictionary.
+          3. Create parent directories if needed.
+          4. Write the JSON to a temporary file (filepath.tmp).
+          5. Atomically rename the temporary file to the target.
+
+        If any step fails, the temporary file is removed, and the
+        previous checkpoint (if any) remains untouched.
 
         Args:
-            filepath: Target file path.
-            model_state: JSON‑serializable model parameters.
-            optimizer_state: JSON‑serializable optimizer state (must include full internal state).
+            filepath: Where to save the checkpoint.
+            model_state: Model parameters (e.g., weights and biases).
+            optimizer_state: Optimizer internal state (must be complete).
             epoch: Current epoch number.
-            metrics: Dictionary of metric names to values (must be JSON‑serializable).
-            scheduler_state: (Optional) JSON‑serializable scheduler state.
-
-        Raises:
-            TypeError: If any argument has incorrect type or contains non‑JSON‑serializable data.
-            ValueError: If serialisation produces NaN/Infinity (allow_nan=False).
-            OSError: On filesystem errors.
+            metrics: Dictionary of metric values.
+            scheduler_state: (Optional) Learning rate scheduler state.
         """
-        # Type checks – raise TypeError for type mismatches
+        # --- Type checks (clear, early failures) ---
         if not isinstance(epoch, int) or isinstance(epoch, bool):
             raise TypeError("epoch must be int")
         if not isinstance(model_state, dict):
@@ -174,6 +236,7 @@ class ModelCheckpoint:
         if scheduler_state is not None and not isinstance(scheduler_state, dict):
             raise TypeError("scheduler_state must be dict")
 
+        # --- Build checkpoint structure ---
         checkpoint: dict[str, Any] = {
             "epoch": epoch,
             "model_state": model_state,
@@ -183,9 +246,10 @@ class ModelCheckpoint:
         if scheduler_state is not None:
             checkpoint["scheduler_state"] = scheduler_state
 
-        # Ensure parent directory exists
+        # --- Ensure directory exists ---
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
 
+        # --- Atomic write via temporary file ---
         tmp_path = f"{filepath}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -194,11 +258,12 @@ class ModelCheckpoint:
                     f,
                     indent=2,
                     sort_keys=True,
-                    allow_nan=False,  # reject NaN/Infinity
+                    allow_nan=False,  # Reject NaN/Infinity – they are not valid JSON numbers.
                 )
+            # Atomic rename (replaces destination only if rename succeeds)
             os.replace(tmp_path, filepath)
         except TypeError as e:
-            # JSON serialisation error (non‑serialisable object)
+            # JSON serialisation error (non‑serialisable object or invalid float)
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise TypeError(
@@ -214,35 +279,42 @@ class ModelCheckpoint:
     @staticmethod
     def load_checkpoint(filepath: str) -> dict[str, Any]:
         """
-        Load checkpoint with rigorous validation.
+        Load a checkpoint from disk with thorough validation.
 
-        Raises:
-            FileNotFoundError: If file does not exist.
-            ValueError: If JSON is malformed or root is not a dict.
-            KeyError: If required keys are missing.
-            TypeError: If epoch, model_state, optimizer_state, metrics, or scheduler_state
-                       have the wrong type.
+        Checks:
+          - File exists and is readable.
+          - JSON is well‑formed.
+          - The root is a JSON object.
+          - All required keys are present.
+          - The values have the expected types (epoch int, state dicts, etc.).
+
+        Returns:
+            The checkpoint dictionary.
+
+        Raises appropriate exceptions if any check fails.
         """
+        # --- File existence ---
         if not os.path.isfile(filepath):
             raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
 
+        # --- Read and parse JSON ---
         with open(filepath, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
             except json.JSONDecodeError as e:
                 raise ValueError(f"Malformed JSON in checkpoint: {e}") from e
 
-        # Root must be a dict
+        # --- Ensure the root is a dictionary ---
         if not isinstance(data, dict):
-            raise ValueError("Checkpoint root must be a JSON object.") # noqa: TRY004
+            raise ValueError("Checkpoint root must be a JSON object.")
 
-        # Required keys
+        # --- Required keys ---
         required_keys = {"epoch", "model_state", "optimizer_state", "metrics"}
         missing = required_keys - set(data.keys())
         if missing:
             raise KeyError(f"Checkpoint missing required keys: {missing}")
 
-        # Type checks
+        # --- Type validation ---
         if not isinstance(data["epoch"], int) or isinstance(data["epoch"], bool):
             raise TypeError("epoch must be int")
         if not isinstance(data["model_state"], dict):
