@@ -61,7 +61,7 @@ class MetricsCalculator:
         # Every label must be a valid integer in the allowed range
         for label in y_true + y_pred:
             if (
-                isinstance(label, bool)  # bool is a subclass of int, but we reject it
+                isinstance(label, bool)          # bool is a subclass of int, but we reject it
                 or not isinstance(label, Integral)
                 or not (0 <= int(label) < self.num_classes)
             ):
@@ -306,7 +306,7 @@ class ModelCheckpoint:
 
         # --- Ensure the root is a dictionary ---
         if not isinstance(data, dict):
-            raise ValueError("Checkpoint root must be a JSON object.")
+            raise ValueError("Checkpoint root must be a JSON object.")  # noqa: TRY004
 
         # --- Required keys ---
         required_keys = {"epoch", "model_state", "optimizer_state", "metrics"}

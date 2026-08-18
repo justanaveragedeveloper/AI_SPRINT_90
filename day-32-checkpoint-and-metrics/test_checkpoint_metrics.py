@@ -476,7 +476,6 @@ class TestCheckpointSaveLoad:
 
     def test_non_json_serializable_state_raises(self, temp_checkpoint_path):
         """Attempting to save non‑JSON‑serializable data raises TypeError."""
-
         class Dummy:
             pass
 
