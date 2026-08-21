@@ -14,7 +14,7 @@ def create_vocabulary(sentences):
     for sentence in sentences:
         words = sentence.lower().split()
         vocab.update(words)
-    return sorted(list(vocab))
+    return sorted(list(vocab))  # noqa: C414
 
 # Bag of Words with frequency counting
 def sentence_to_frequency(sentence, vocabulary):
