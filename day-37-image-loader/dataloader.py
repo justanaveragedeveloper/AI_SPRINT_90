@@ -135,8 +135,8 @@ class DataLoader:
 
     Why drop_last?
     ──────────────
-    Many normalisation layers (e.g., BatchNorm) require a consistent batch size.
-    Dropping the incomplete final batch ensures all batches have exactly B samples.
+    drop_last=True ensures every yielded batch has exactly B samples.
+    This can be useful when a training setup expects fixed batch sizes.
     """
 
     def __init__(
