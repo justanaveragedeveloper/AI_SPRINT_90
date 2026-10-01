@@ -68,6 +68,7 @@ Reproducibility
 The module consumes no randomness, so no seed is required. Every score is
 a deterministic function of the two input strings.
 """
+
 from __future__ import annotations
 
 import logging
@@ -204,6 +205,7 @@ def _score_query_token(
 # `top_k=True` would silently pass integer validation.
 # =========================================================================== #
 
+
 def _check_str(name: str, value: Any) -> None:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a str, got {type(value).__name__}")
@@ -282,6 +284,7 @@ def _check_reranked_candidate(index: int, item: Any) -> RerankedCandidate:
 # =========================================================================== #
 # Cross-encoder re-ranker
 # =========================================================================== #
+
 
 class CrossEncoderReranker:
     """Lexical simulator of a cross-encoder scoring head.
@@ -392,7 +395,9 @@ class CrossEncoderReranker:
         result = scored[:top_k]
         logger.debug(
             "rerank: %d candidates in, %d kept (top_k=%d)",
-            len(validated), len(result), top_k,
+            len(validated),
+            len(result),
+            top_k,
         )
         return result
 
@@ -400,6 +405,7 @@ class CrossEncoderReranker:
 # =========================================================================== #
 # Contextual compression
 # =========================================================================== #
+
 
 class ContextualCompressionFilter:
     """Sentence-level salience filter.
@@ -425,9 +431,7 @@ class ContextualCompressionFilter:
                 f"got {type(reranker).__name__}"
             )
         self.reranker = reranker
-        self.threshold = _check_number(
-            "threshold", threshold, minimum=0.0, maximum=1.0
-        )
+        self.threshold = _check_number("threshold", threshold, minimum=0.0, maximum=1.0)
 
     # -- sentence utilities --------------------------------------------- #
 
@@ -534,14 +538,22 @@ if __name__ == "__main__":
     query = "gradient clipping exploding gradients"
     candidates: list[Candidate] = [
         (0, 0.62, "Photosynthesis converts light into chemical energy in plants."),
-        (1, 0.55, (
-            "Gradient clipping rescales gradients to prevent exploding "
-            "gradients. The technique is standard in recurrent network training."
-        )),
-        (2, 0.71, (
-            "Batch normalization stabilizes training. "
-            "Unrelated: the MERN stack uses MongoDB and Express."
-        )),
+        (
+            1,
+            0.55,
+            (
+                "Gradient clipping rescales gradients to prevent exploding "
+                "gradients. The technique is standard in recurrent network training."
+            ),
+        ),
+        (
+            2,
+            0.71,
+            (
+                "Batch normalization stabilizes training. "
+                "Unrelated: the MERN stack uses MongoDB and Express."
+            ),
+        ),
     ]
 
     reranked = reranker.rerank(query, candidates, top_k=3)
