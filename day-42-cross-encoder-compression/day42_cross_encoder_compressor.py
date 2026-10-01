@@ -86,10 +86,10 @@ logger.addHandler(logging.NullHandler())
 
 __all__ = [
     "Candidate",
-    "RerankedCandidate",
     "CompressedPayload",
-    "CrossEncoderReranker",
     "ContextualCompressionFilter",
+    "CrossEncoderReranker",
+    "RerankedCandidate",
 ]
 
 
