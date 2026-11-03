@@ -2,7 +2,7 @@ import math
 
 import chromadb  # type: ignore
 import numpy as np
-from chromadb import Documents, EmbeddingFunction, Embeddings  # type: ignore
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings  # type: ignore
 from chromadb.config import Settings  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 
