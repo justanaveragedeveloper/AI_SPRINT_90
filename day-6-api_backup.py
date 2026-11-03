@@ -1,10 +1,11 @@
 import os
-from typing import Dict, Any, List, Optional
+from typing import Any
+
+import chromadb  # type: ignore
+from chromadb.utils import embedding_functions  # type: ignore
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import chromadb
-from chromadb.utils import embedding_functions
 
 # ==========================================
 # 1. PYDANTIC DATA VALIDATION SCHEMAS
@@ -13,7 +14,7 @@ from chromadb.utils import embedding_functions
 class UpsertRequest(BaseModel):
     id: str = Field(..., description="Unique identifier for the document (e.g., user_id or job_id)")
     text: str = Field(..., min_length=3, description="The text content to be vectorized and stored")
-    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata key-value pairs")
+    metadata: dict[str, Any] | None = Field(default=None, description="Optional metadata key-value pairs")
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=2, description="The semantic search query string")
@@ -60,8 +61,8 @@ try:
         metadata={"hnsw:space": "cosine"} # Forces mathematically normalized cosine distance
     )
     print(f"✅ Successfully mounted ChromaDB from: {DB_PATH}")
-except Exception as e:
-    print(f"❌ Database initialization failure: {str(e)}")
+except Exception as e:  # noqa: BLE001
+    print(f"❌ Database initialization failure: {e!s}")
     raise RuntimeError("Could not connect to the persistent ChromaDB cluster.")
 
 # ==========================================
@@ -90,10 +91,10 @@ async def upsert_document(payload: UpsertRequest):
             "status": "success",
             "message": f"Document ID '{payload.id}' successfully indexed into vector space."
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to upsert payload into ChromaDB: {str(e)}"
+            detail=f"Failed to upsert payload into ChromaDB: {e!s}"
         )
 
 
@@ -131,16 +132,16 @@ async def search_vectors(payload: SearchRequest):
             "results": formatted_results
         }
         
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Vector search engine encountered an error: {str(e)}"
+            detail=f"Vector search engine encountered an error: {e!s}"
         )
 
 # ==========================================
 # 5. EXECUTION ENTRYPOINT
 # ==========================================
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn  # type: ignore
     # Host on localhost, port 8000
     uvicorn.run("day6_api.py:app", host="127.0.0.1", port=8000, reload=True)

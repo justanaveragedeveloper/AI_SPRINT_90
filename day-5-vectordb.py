@@ -1,10 +1,10 @@
-import chromadb
-from chromadb.config import Settings
-from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
-from sentence_transformers import SentenceTransformer
-from typing import List
-import numpy as np
 import math
+
+import chromadb  # type: ignore
+import numpy as np
+from chromadb import Documents, EmbeddingFunction, Embeddings  # type: ignore
+from chromadb.config import Settings  # type: ignore
+from sentence_transformers import SentenceTransformer  # type: ignore
 
 # ============================================
 # PROPER EmbeddingFunction Implementation
@@ -107,7 +107,7 @@ try:
         stored_metric = collection.metadata["hnsw:space"]
         if stored_metric != DISTANCE_METRIC:
             print(f"⚠️  WARNING: Collection uses '{stored_metric}' but script expects '{DISTANCE_METRIC}'")
-            print(f"   Similarity scores may be incorrect!")
+            print("   Similarity scores may be incorrect!")
     
     print(f"✓ Using existing collection: '{collection_name}'")
     print(f"  Distance metric: {DISTANCE_METRIC}")
@@ -251,23 +251,23 @@ distance = identical_result['distances'][0][0]
 similarity = similarity_from_distance(distance, DISTANCE_METRIC)
 
 print(f"Query text: '{test_text}'")
-print(f"Same document retrieved (ID: test_identical)")
+print("Same document retrieved (ID: test_identical)")
 print(f"Raw distance: {distance:.6f}")
 print(f"Similarity score: {similarity:.6f}")
 
 if DISTANCE_METRIC == "cosine":
     expected_similarity = 1.0
-    print(f"✓ For cosine metric, perfect match should be 1.0")
+    print("✓ For cosine metric, perfect match should be 1.0")
     print(f"  Actual: {similarity:.6f} (Difference: {abs(expected_similarity - similarity):.6f})")
 elif DISTANCE_METRIC == "l2":
-    print(f"✓ For L2 metric, perfect match is 0.0 distance → similarity~1.0")
+    print("✓ For L2 metric, perfect match is 0.0 distance → similarity~1.0")
     print(f"  Actual similarity: {similarity:.6f}")
 
 # Clean up test document
 collection.delete(ids=["test_identical"])
 
-print(f"\nCurrent configuration:")
+print("\nCurrent configuration:")
 print(f"  Distance Metric: {DISTANCE_METRIC}")
-print(f"  Similarity Range: [0, 1] (1 = most similar)")
+print("  Similarity Range: [0, 1] (1 = most similar)")
 print(f"  Collection: {collection_name}")
 print(f"  Total Vectors: {collection.count()}")

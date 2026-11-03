@@ -1,6 +1,6 @@
-import torch
-from sentence_transformers import SentenceTransformer, util
 import numpy as np
+import torch  # type: ignore
+from sentence_transformers import SentenceTransformer, util  # type: ignore
 
 # Load pre-trained sentence transformer model
 model = SentenceTransformer('all-MiniLM-L6-v2')
