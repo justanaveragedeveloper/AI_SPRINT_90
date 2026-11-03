@@ -1,5 +1,7 @@
-import numpy as np
 import json
+
+import numpy as np
+
 
 # Load job descriptions from JSON
 def load_data(file_path='data.json'):
@@ -13,7 +15,7 @@ def create_vocabulary(documents):
     for doc in documents:
         words = doc.lower().split()
         vocab.update(words)
-    return sorted(list(vocab))
+    return sorted(vocab)
 
 # Compute Term Frequency (TF)
 def compute_tf(document, vocabulary):
@@ -102,7 +104,7 @@ def search(query, vocabulary, idf_vector, tfidf_matrix, job_descriptions):
 
 # Display all matches ranked
 def display_all_matches(similarities, job_descriptions, query):
-    print(f"\n   📊 ALL MATCHES RANKED:")
+    print("\n   📊 ALL MATCHES RANKED:")
     # Create list of (index, score) pairs and sort by score descending
     ranked = sorted([(i, similarities[i]) for i in range(len(similarities))], 
                     key=lambda x: x[1], reverse=True)
@@ -176,32 +178,32 @@ def main():
         )
         
         # Display results
-        print(f"\n   🏆 TOP MATCH:")
+        print("\n   🏆 TOP MATCH:")
         print(f"   Job {best_idx+1}: {best_job}")
         print(f"   📊 Confidence Score: {score:.3f} ({score*100:.1f}%)")
         
         # Provide recommendation strength
         if score > 0.3:
-            print(f"   ✅ STRONG MATCH - Highly recommend this candidate")
+            print("   ✅ STRONG MATCH - Highly recommend this candidate")
         elif score > 0.1:
-            print(f"   ⚠️ MODERATE MATCH - Consider reviewing other options")
+            print("   ⚠️ MODERATE MATCH - Consider reviewing other options")
         elif score > 0:
-            print(f"   ❌ WEAK MATCH - Job may not be relevant")
+            print("   ❌ WEAK MATCH - Job may not be relevant")
         else:
-            print(f"   ❌ NO MATCH FOUND - Try different keywords")
+            print("   ❌ NO MATCH FOUND - Try different keywords")
         
         # Show all matches if there are multiple good ones
         if len(jobs) > 1:
             display_all_matches(all_similarities, jobs, query)
         
         # Smart suggestions based on query
-        print(f"\n   💡 TIP:", end=" ")
+        print("\n   💡 TIP:", end=" ")
         if score < 0.1 and query:
-            print(f"Try using more specific keywords like 'React', 'Python', or 'NodeJS'")
+            print("Try using more specific keywords like 'React', 'Python', or 'NodeJS'")
         elif score > 0.3:
-            print(f"This is a strong match! Contact this candidate")
+            print("This is a strong match! Contact this candidate")
         else:
-            print(f"Try rephrasing your search or use technical keywords")
+            print("Try rephrasing your search or use technical keywords")
 
 # Run the interactive search engine
 if __name__ == "__main__":
